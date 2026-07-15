@@ -1,0 +1,21 @@
+# Deep learning framework
+torch
+torchvision
+
+# Vision-language models (CLIP, SigLIP, GPT-2)
+transformers
+
+# Parameter-efficient fine-tuning (LoRA)
+peft
+accelerate
+bitsandbytes==0.45.5
+torchao==0.16.0
+
+# Captioning evaluation metrics (BLEU, CIDEr, ROUGE)
+pycocoevalcap==1.2
+nltk==3.9.1
+
+# Data handling
+pandas
+numpy
+Pillow
