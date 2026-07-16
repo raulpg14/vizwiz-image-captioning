@@ -1,11 +1,10 @@
 """
 Training loop infrastructure shared by both VizWiz captioning architectures,
-plus Architecture 1 (ClipCap) specific training adapters.
+plus Architecture-specific training adapters (ClipCap and SR-ClipCap).
 
 This module is import-safe: importing it has no side effects. Training only
-starts when `train_model()` is explicitly called with a fully-constructed
-model, dataloaders, optimizer, etc. — see `run_clipcap_training()` at the
-bottom of this file for the Architecture 1 entry point.
+starts when `train_model()` or one of the architecture entry points
+(`run_clipcap_training`, `run_sr_clipcap_training`) is explicitly called.
 """
 
 import os
@@ -16,6 +15,8 @@ from pathlib import Path
 import numpy as np
 import torch
 from tqdm import tqdm
+from transformers import get_cosine_schedule_with_warmup
+from peft import get_peft_model_state_dict, set_peft_model_state_dict
 
 from src.training.metrics import word_tokens
 from nltk.translate.bleu_score import SmoothingFunction, corpus_bleu
@@ -88,26 +89,6 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
     Reusable training loop with per-stage stopping criteria, used by both
     Architecture 1 and Architecture 2 via their own train/validate/checkpoint
     adapter functions.
-
-    Args:
-        train_epoch_fn(model, loader, criterion, optimizer, scaler, device, scheduler, epoch) -> float
-        validate_epoch_fn(model, loader, criterion, device, epoch) -> float
-        val_metric_fns: dict mapping criterion name -> callable(model) -> float,
-            e.g. {'val_cider': fn, 'val_bleu4': fn}. The active criterion is
-            read from state['stopping_criterion'], set by `stage_callback`.
-        stage_callback(epoch, model, state): called at epoch 0 (setup) and at
-            stage transitions, to freeze/unfreeze parameters or rebuild the
-            optimizer/scheduler. May be None for single-stage training.
-        checkpoint_builder: function producing the dict saved to disk on each
-            new best checkpoint. Defaults to `default_checkpoint_payload`.
-        val_loss_min_delta / early_stop_min_delta: float, or dict mapping
-            criterion names to their own min_delta. Either name is accepted;
-            they're kept as separate parameters because Architecture 1 and 2
-            historically used different names for the same concept.
-        seed: base random seed, re-derived per-epoch for reproducibility.
-
-    Returns:
-        dict with the trained model, histories, and best-metric bookkeeping.
     """
     min_delta_source = val_loss_min_delta if val_loss_min_delta is not None else early_stop_min_delta
     metric_min_deltas = min_delta_source if min_delta_source is not None else 0.0
@@ -157,6 +138,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
     for epoch in range(num_epochs):
         epoch_start = time.time()
         stage1_hard_cap_epoch = state.get('stage1_hard_cap_epoch')
+        
         if (
             stage_callback is not None
             and state.get('current_stage') == 1
@@ -515,15 +497,9 @@ def make_a1_stage_callback(mapping_lr, gpt2_lr, warmup_epochs, train_loader, tot
     Builds the Architecture 1 stage callback: starts with GPT-2 frozen
     (mapping network trains alone), then unfreezes GPT-2 and rebuilds the
     optimizer/scheduler for joint fine-tuning at `warmup_epochs`.
-
-    Args:
-        train_loader: needed to compute remaining scheduler steps at the
-            unfreeze transition.
-        total_steps: total training steps planned across all epochs.
     """
     from src.models.clipcap import set_gpt2_trainable
-    from transformers import get_cosine_schedule_with_warmup
-
+    
     def stage_callback(epoch, model, state):
         if epoch == 0:
             set_gpt2_trainable(model, trainable=False)
@@ -592,26 +568,7 @@ def run_clipcap_training(model, train_loader, val_loader, tokenizer, val_feature
                           warmup_steps=500, patience=5, eval_start_epoch=4,
                           warmup_epochs=2, warmup_temp_epochs=4, warmup_temp=2.0,
                           max_caption_len=20, val_loss_min_delta=None):
-    """
-    Architecture 1 (ClipCap) training entry point. Constructs the criterion,
-    optimizer, scheduler, stage callback, and hparams dict, then delegates
-    to the shared `train_model()` loop.
-
-    This is the function equivalent of the notebook's Architecture 1
-    training cell — call this instead of copy-pasting the setup each time.
-
-    Args:
-        greedy_decode_fn: decoding function from src/inference.py (built in
-            Step 5), e.g. `inference.greedy_decode`. Passed in explicitly
-            rather than imported here, to avoid a circular import between
-            src/training/train.py and src/inference.py.
-        evaluate_cider_fn: validation CIDEr routine from src/inference.py,
-            e.g. `inference.evaluate_cider_with_decoder`.
-
-    Returns the same dict as `train_model()`.
-    """
-    from transformers import get_cosine_schedule_with_warmup
-
+    """Architecture 1 (ClipCap) training entry point."""
     total_steps = epochs * len(train_loader)
 
     criterion = torch.nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=0.1)
@@ -650,7 +607,7 @@ def run_clipcap_training(model, train_loader, val_loader, tokenizer, val_feature
             warmup_temp_epochs=warmup_temp_epochs, warmup_temp=warmup_temp,
         )
 
-    result = train_model(
+    return train_model(
         model, train_loader, val_loader,
         criterion, optimizer, scheduler, scaler,
         train_epoch_fn=train_epoch_fn,
@@ -675,4 +632,446 @@ def run_clipcap_training(model, train_loader, val_loader, tokenizer, val_feature
         val_loss_min_delta=val_loss_min_delta,
     )
 
-    return result
+
+# --------------------------------------------------------------------------
+# Architecture 2 (SR-ClipCap) training adapters
+# --------------------------------------------------------------------------
+
+def build_extended_labels(labels, prefix_length):
+    """
+    Masks visual prefixes for loss calculation; text-side padding mask
+    is already applied by the dataset.
+    """
+    labels = labels.clone()
+    prefix_labels = torch.full(
+        (labels.size(0), prefix_length),
+        fill_value=-100,
+        dtype=labels.dtype,
+        device=labels.device,
+    )
+    return torch.cat([prefix_labels, labels], dim=1)
+
+
+def compute_sr_clipcap_loss(logits, labels, prefix_length, criterion):
+    """Computes causal LM loss strictly over text targets for Architecture 2."""
+    extended_labels = build_extended_labels(labels, prefix_length)
+
+    shift_logits = logits[:, :-1, :].contiguous()
+    shift_labels = extended_labels[:, 1:].contiguous()
+
+    return criterion(
+        shift_logits.reshape(-1, shift_logits.size(-1)),
+        shift_labels.reshape(-1),
+    )
+
+
+def train_one_epoch_sr(
+    model, loader, criterion, optimizer, scaler, device,
+    scheduler=None, epoch=0, context_dropout_prob=0.0,
+    context_dropout_stats=None, grad_clip_norm=0.5
+):
+    """Architecture 2 batch training adapter for the shared train_model loop."""
+    model.train()
+    running_loss = 0.0
+    steps_run = 0
+    device_type = device.type if hasattr(device, 'type') else str(device)
+    
+    progress = tqdm(loader, desc='Training', leave=False, unit='batch')
+    for batch in progress:
+        spatial_tokens = batch['spatial_tokens'].to(device, non_blocking=True)
+        input_ids = batch['input_ids'].to(device, non_blocking=True)
+        attention_mask = batch['attention_mask'].to(device, non_blocking=True)
+        labels = batch['labels'].to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+
+        with torch.amp.autocast('cuda', enabled=(device_type == 'cuda')):
+            logits = model(
+                spatial_tokens=spatial_tokens,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                context_dropout_prob=context_dropout_prob,
+            )
+            
+            if context_dropout_stats is not None:
+                batch_stats = getattr(model, '_last_context_dropout_stats', None)
+                if batch_stats is not None:
+                    context_dropout_stats['total'] += int(batch_stats.get('total', 0))
+                    context_dropout_stats['dropped'] += int(batch_stats.get('dropped', 0))
+                    
+            loss = compute_sr_clipcap_loss(
+                logits=logits,
+                labels=labels,
+                prefix_length=model.prefix_length,
+                criterion=criterion,
+            )
+
+        if torch.isnan(loss) or torch.isinf(loss):
+            print("  [WARNING] NaN/Inf loss, skipping batch.")
+            optimizer.zero_grad(set_to_none=True)
+            continue
+
+        if not loss.requires_grad:
+            raise RuntimeError("Detached Stage-1 loss: resampler/output_scale are not connected to GPT logits.")
+
+        optimizer_was_run = True
+
+        if scaler is not None:
+            scale_before = scaler.get_scale()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
+            scaler.step(optimizer)
+            scaler.update()
+            scale_after = scaler.get_scale()
+            optimizer_was_run = scale_after >= scale_before
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
+            optimizer.step()
+
+        if scheduler is not None and optimizer_was_run:
+            scheduler.step()
+
+        if optimizer_was_run:
+            running_loss += loss.item()
+            steps_run += 1
+            
+        progress.set_postfix(loss=f"{loss.item():.4f}" if optimizer_was_run else "skip")
+
+    return running_loss / max(1, steps_run)
+
+
+@torch.inference_mode()
+def validate_one_epoch_sr(model, loader, criterion, device, epoch=0):
+    """Architecture 2 validation adapter for the shared train_model loop."""
+    model.eval()
+    running_loss = 0.0
+    steps_run = 0
+    device_type = device.type if hasattr(device, 'type') else str(device)
+
+    progress = tqdm(loader, desc='Validation', leave=False, unit='batch')
+    for batch in progress:
+        spatial_tokens = batch['spatial_tokens'].to(device, non_blocking=True)
+        input_ids = batch['input_ids'].to(device, non_blocking=True)
+        attention_mask = batch['attention_mask'].to(device, non_blocking=True)
+        labels = batch['labels'].to(device, non_blocking=True)
+
+        with torch.amp.autocast('cuda', enabled=(device_type == 'cuda')):
+            logits = model(
+                spatial_tokens=spatial_tokens,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            )
+            loss = compute_sr_clipcap_loss(
+                logits=logits,
+                labels=labels,
+                prefix_length=model.prefix_length,
+                criterion=criterion,
+            )
+
+        running_loss += loss.item()
+        steps_run += 1
+        progress.set_postfix(loss=f"{loss.item():.4f}")
+
+    return running_loss / max(1, steps_run)
+
+
+def get_a2_lora_state_dict(model, adapter_name='default'):
+    """Return PEFT adapter tensors only, excluding frozen GPT-2 base weights."""
+    adapter_state = get_peft_model_state_dict(
+        model.gpt,
+        adapter_name=adapter_name,
+        save_embedding_layers=False,
+    )
+    return {key: value.detach().cpu() for key, value in adapter_state.items()}
+
+
+def build_a2_light_checkpoint(model, state, epoch, train_loss, val_loss, val_metric,
+                              best_metric, best_metric_epoch, histories, hparams):
+    """Architecture 2 checkpoint, packing only the Resampler and LoRA weights."""
+    active_monitor = state.get('stopping_criterion', 'val_loss')
+    peft_state_dict = get_a2_lora_state_dict(model, adapter_name='default')
+
+    return {
+        'checkpoint_type' : 'a2_resampler_lora_only',
+        'resampler'       : {k: v.detach().cpu() for k, v in model.resampler.state_dict().items()},
+        'output_scale'    : float(model.output_scale.detach().cpu().item()),
+        'adapter_name'    : 'default',
+        'peft_state_dict' : peft_state_dict,
+        'lora_state'      : peft_state_dict,
+        'epoch'           : epoch,
+        'train_loss'      : train_loss,
+        'val_loss'        : val_loss,
+        'cider'           : val_metric,
+        'monitor'         : active_monitor,
+        'active_monitor'  : active_monitor,
+        'current_stage'   : state.get('current_stage'),
+        'metric_mode'     : state.get('metric_mode', 'min'),
+        'best_metric_name': active_monitor,
+        'best_metric_value': state.get('best_tracked_metric'),
+        'best_metric_epoch': state.get('best_tracked_metric_epoch'),
+        'best_cider'      : best_metric,
+        'best_cider_epoch': best_metric_epoch,
+        'optimizer'       : state['optimizer'].state_dict(),
+        'scheduler'       : state['scheduler'].state_dict() if state.get('scheduler') is not None else None,
+        'scaler'          : state['scaler'].state_dict() if state.get('scaler') is not None else None,
+        'hparams'         : hparams,
+        'train_losses'    : histories['train_losses'],
+        'val_losses'      : histories['val_losses'],
+        'val_ciders'      : histories['val_ciders'],
+        'val_bleu4s'      : histories['val_bleu4s'],
+        'context_drop_rates': histories.get('context_drop_rates', []),
+        'learning_rates'  : histories['learning_rates'],
+        'rng_state'       : {
+            'python' : random.getstate(),
+            'numpy'  : np.random.get_state(),
+            'torch'  : torch.get_rng_state(),
+            'cuda'   : torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        },
+    }
+
+
+def load_a2_light_checkpoint(model, checkpoint, device=None):
+    """Restores an A2 light checkpoint seamlessly mapping Resampler and LoRA weights."""
+    if 'model_state' in checkpoint:
+        model.load_state_dict(checkpoint['model_state'])
+        return
+    if 'resampler' not in checkpoint:
+        model.load_state_dict(checkpoint)
+        return
+
+    resampler_result = model.resampler.load_state_dict(checkpoint['resampler'], strict=False)
+    if resampler_result.missing_keys or resampler_result.unexpected_keys:
+        print(
+            f"WARNING: Resampler load mismatch! Missing: {resampler_result.missing_keys}, "
+            f"Unexpected: {resampler_result.unexpected_keys}"
+        )
+        
+    output_scale = torch.as_tensor(
+        checkpoint['output_scale'],
+        device=model.output_scale.device,
+        dtype=model.output_scale.dtype,
+    )
+    model.output_scale.data.copy_(output_scale)
+
+    peft_state_dict = checkpoint.get('peft_state_dict', checkpoint.get('lora_state', {}))
+    if peft_state_dict:
+        load_result = set_peft_model_state_dict(
+            model.gpt,
+            peft_state_dict,
+            adapter_name=checkpoint.get('adapter_name', 'default'),
+        )
+        missing_keys = getattr(load_result, 'missing_keys', [])
+        unexpected_keys = getattr(load_result, 'unexpected_keys', [])
+        if missing_keys or unexpected_keys:
+            print(f"WARNING: PEFT load mismatch! Missing: {missing_keys}, Unexpected: {unexpected_keys}")
+
+
+def run_sr_clipcap_training(model, train_loader, val_loader, tokenizer, val_features_dir, val_references, *,
+                            checkpoint_path, device, decoder_fn, evaluate_cider_fn,
+                            stage1_resampler_lr=1e-4, stage1_warmup_steps=200,
+                            stage2_lora_lr=2e-4, stage2_warmup_steps=100,
+                            stage3_resampler_lr=5e-6, stage3_lora_lr=1e-5,
+                            patience=5, max_epochs=60, eval_start_epoch=3,
+                            weight_decay=0.01, context_dropout_prob=0.1,
+                            stage1_hard_cap_epoch=15, cider_floor_delta=0.05,
+                            val_loss_min_delta=None):
+    """
+    Metric-driven 3-stage training for SR-ClipCap.
+
+    Stage transitions are triggered by validation metric plateaus, not fixed epochs:
+    - Stage 1 exits when val_loss plateaus (Resampler only).
+    - Stage 2 exits when val_cider plateaus (LoRA only).
+    - Stage 3 applies standard early stopping on val_bleu4 (Joint Fine-tuning).
+    """
+    def _a2_feature_loader(img_id):
+        # Dynamically load the tensor from disk for the validation functions
+        feature_path = Path(val_features_dir) / f"{img_id}.pt"
+        return torch.load(feature_path, map_location='cpu', weights_only=True)
+
+    # ── Stage 1 setup: keep PEFT path enabled but freeze all GPT/LoRA weights ─
+    model.gpt.enable_adapter_layers() 
+    for p in model.gpt.parameters():
+        p.requires_grad_(False)
+    for p in model.resampler.parameters():
+        p.requires_grad_(True)
+    model.output_scale.requires_grad_(True)
+
+    print('=' * 65)
+    print('Starting training: Architecture 2 SR-ClipCap (Metric-Driven Stages)')
+    print(f'  Stage 1 → val_loss plateau  : Resampler only  (LR={stage1_resampler_lr:.0e})')
+    print(f'  Stage 2 → val_cider plateau : LoRA only       (LR={stage2_lora_lr:.0e})')
+    print(f'  Stage 3 → val_bleu4 early stop  : Joint        (Res={stage3_resampler_lr:.0e}, LoRA={stage3_lora_lr:.0e})')
+    print(f'  Patience: {patience} | Max epochs: {max_epochs} | Eval starts: epoch {eval_start_epoch + 1}')
+    print('=' * 65)
+
+    optimizer = torch.optim.AdamW([
+        {'params': model.resampler.parameters(), 'lr': stage1_resampler_lr},
+        {'params': [model.output_scale],          'lr': stage1_resampler_lr},
+    ], weight_decay=weight_decay)
+
+    # Cap Stage 1 scheduler to a realistic single cosine cycle
+    _stage1_max_steps = min(
+        stage1_warmup_steps * 10,
+        (max_epochs * len(train_loader)) // 3,
+    )
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=min(stage1_warmup_steps, _stage1_max_steps // 4),
+        num_training_steps=_stage1_max_steps,
+    )
+    
+    criterion = torch.nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=0.05)
+    scaler = torch.amp.GradScaler('cuda', init_scale=1024) if device.type == 'cuda' else None
+
+    # Internal state reference for tracking active dropout configuration
+    state_ref = [{}]
+
+    def a2_stage_callback(epoch, active_model, state):
+        """Advances metric monitors and rebuilds the optimizer on patience exhaustion."""
+        current_stage = state.get('current_stage', 1)
+        next_stage    = current_stage + 1
+        state['current_stage'] = next_stage
+
+        # ── Stage 1 → Stage 2 ─────────────────────────────────────────────────
+        if next_stage == 2:
+            print(f'\n--- Patience triggered: Stage 1 → Stage 2 (after epoch {epoch}) ---')
+            print( '    Freezing Resampler/output_scale. Unfreezing LoRA. Criterion: val_cider.')
+
+            for param in active_model.resampler.parameters():
+                param.requires_grad = False
+            active_model.output_scale.requires_grad = False
+
+            active_model.gpt.enable_adapter_layers()
+            lora_params = [p for n, p in active_model.gpt.named_parameters() if 'lora_' in n]
+            for p in lora_params:
+                p.requires_grad = True
+
+            steps_remaining = (max_epochs - epoch) * len(train_loader)
+            state['optimizer'] = torch.optim.AdamW([
+                {'params': lora_params, 'lr': stage2_lora_lr},
+            ], weight_decay=weight_decay)
+            
+            state['scheduler'] = get_cosine_schedule_with_warmup(
+                state['optimizer'],
+                num_warmup_steps=min(stage2_warmup_steps, steps_remaining // 4),
+                num_training_steps=steps_remaining,
+            )
+
+            state['stopping_criterion']   = 'val_cider'
+            state['metric_mode']          = 'max'
+            state['context_dropout_prob'] = context_dropout_prob 
+
+            trainable = sum(p.numel() for p in active_model.parameters() if p.requires_grad)
+            print(f'    Trainable params: {trainable:,} | LR: {stage2_lora_lr:.0e}')
+            print(f'    Context dropout activated: p={context_dropout_prob}')
+
+        # ── Stage 2 → Stage 3 ─────────────────────────────────────────────────
+        elif next_stage == 3:
+            print(f'\n--- Patience triggered: Stage 2 → Stage 3 (after epoch {epoch}) ---')
+            print( '    Unfreezing Resampler. Joint fine-tuning. Criterion: val_bleu4.')
+            state['stage2_best_cider'] = float(state.get('best_tracked_metric', float('-inf')))
+            state['cider_floor_delta'] = float(cider_floor_delta)
+
+            for param in active_model.resampler.parameters():
+                param.requires_grad = True
+            active_model.output_scale.requires_grad = True
+
+            lora_params = [p for n, p in active_model.gpt.named_parameters() if 'lora_' in n]
+            steps_remaining = (max_epochs - epoch) * len(train_loader)
+            
+            state['optimizer'] = torch.optim.AdamW([
+                {'params': active_model.resampler.parameters(), 'lr': stage3_resampler_lr},
+                {'params': [active_model.output_scale],         'lr': stage3_resampler_lr},
+                {'params': lora_params,                         'lr': stage3_lora_lr},
+            ], weight_decay=weight_decay)
+            
+            state['scheduler'] = get_cosine_schedule_with_warmup(
+                state['optimizer'],
+                num_warmup_steps=0,
+                num_training_steps=steps_remaining,
+            )
+
+            state['stopping_criterion']   = 'val_bleu4'
+            state['metric_mode']          = 'max'
+            state['context_dropout_prob'] = context_dropout_prob 
+
+            trainable = sum(p.numel() for p in active_model.parameters() if p.requires_grad)
+            print(f'    Trainable params: {trainable:,}')
+            print(f'    Resampler LR: {stage3_resampler_lr:.0e} | LoRA LR: {stage3_lora_lr:.0e}')
+            print(f"    CIDEr floor: {state['stage2_best_cider'] - state['cider_floor_delta']:.4f} "
+                  f"(Stage-2 best={state['stage2_best_cider']:.4f}, delta={state['cider_floor_delta']:.4f})")
+            print(f'    Context dropout remains active: p={context_dropout_prob}')
+
+
+    def train_epoch_with_context_dropout(m, loader, crit, opt, scl, dev, sched, ep):
+        active_prob = state_ref[0].get('context_dropout_prob', 0.0)
+        dropout_stats = {'dropped': 0, 'total': 0}
+        state_ref[0]['context_dropout_stats'] = dropout_stats
+        
+        return train_one_epoch_sr(
+            m, loader, crit, opt, scl, dev,
+            scheduler=sched,
+            epoch=ep,
+            context_dropout_prob=active_prob,
+            context_dropout_stats=dropout_stats,
+        )
+
+    def a2_stage_callback_seeded(epoch, active_model, state):
+        """Initialises tracker state once, then delegates execution."""
+        if 'current_stage' not in state:
+            state['current_stage'] = 1
+            state['context_dropout_prob'] = 0.0
+            state['stage1_hard_cap_epoch'] = stage1_hard_cap_epoch
+            state_ref[0] = state
+
+        if epoch is None:
+            return
+
+        a2_stage_callback(epoch, active_model, state)
+
+
+    hparams = {
+        'stage1_resampler_lr': stage1_resampler_lr,
+        'stage2_lora_lr': stage2_lora_lr,
+        'stage3_resampler_lr': stage3_resampler_lr,
+        'stage3_lora_lr': stage3_lora_lr,
+        'patience': patience,
+        'max_epochs': max_epochs,
+        'eval_start_epoch': eval_start_epoch,
+        'weight_decay': weight_decay,
+        'context_dropout': context_dropout_prob,
+        'stage1_hard_cap_epoch': stage1_hard_cap_epoch,
+        'cider_floor_delta': cider_floor_delta,
+    }
+
+    return train_model(
+        model, train_loader, val_loader,
+        criterion, optimizer, scheduler, scaler,
+        train_epoch_fn=train_epoch_with_context_dropout,
+        validate_epoch_fn=validate_one_epoch_sr,
+        val_metric_fns={
+            'val_cider': lambda m: evaluate_cider_fn(
+                m, tokenizer, val_references,
+                feature_loader=_a2_feature_loader,
+                decoder_fn=decoder_fn, device=device,
+            ),
+            'val_bleu4': lambda m: evaluate_bleu4_with_decoder(
+                m, tokenizer, val_references,
+                feature_loader=_a2_feature_loader,
+                decoder_fn=decoder_fn, device=device,
+            ),
+        },
+        checkpoint_path=checkpoint_path,
+        num_epochs=max_epochs,
+        patience=patience,
+        eval_start_epoch=eval_start_epoch,
+        val_loss_min_delta=val_loss_min_delta,
+        hparams=hparams,
+        device=device,
+        run_name='Architecture 2 SR-ClipCap (Metric-Driven)',
+        stage_callback=a2_stage_callback_seeded,
+        checkpoint_builder=build_a2_light_checkpoint,
+        lr_group_index=0,
+    )
